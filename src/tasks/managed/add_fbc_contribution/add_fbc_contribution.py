@@ -9,12 +9,13 @@ Fragments are batched and submitted to IIB in sets of configurable size. The
 snapshot must be previously augmented by prepare-fbc-snapshot to include OCP and
 target index metadata for each component.
 
-Components are split by OCP versions and processed in series. For each OCP
-version, batches are chained so that the final targetIndex produced will have
-all fragments added. The index_image from one internal request is set as the
-fromIndex for the next request within that OCP version.
+Components are split by OCP version. Those groups run in parallel, bounded by
+MAX_PARALLEL_GROUPS. Within a group, batches stay ordered: the index image from
+one request is the fromIndex of the next, so the final target index contains
+every fragment.
 
-Failed batches are retried at the end to allow timed out requests to finish.
+Failed batches are retried at the end of their group so timed out requests can
+finish.
 """
 
 from __future__ import annotations
@@ -22,7 +23,9 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +35,7 @@ from release_service_utils.helpers import file as file_helpers, iib, tekton
 from release_service_utils.helpers.iib import IIBBuild
 from release_service_utils.helpers.internal_request import (
     InternalRequestWaitError,
+    cleanup_existing_requests,
     create,
     fetch_results,
 )
@@ -39,6 +43,8 @@ from release_service_utils.helpers.logger import logger
 
 TASK_LABEL = "internal-services.appstudio.openshift.io/group-id"
 PIPELINERUN_LABEL = "internal-services.appstudio.openshift.io/pipelinerun-uid"
+UPDATE_FBC_CATALOG_PIPELINE = "update-fbc-catalog"
+DEFAULT_MAX_PARALLEL_GROUPS = 5
 
 
 @dataclass
@@ -57,6 +63,7 @@ class AddFBCContributionConfig:
     iib_service_account_secret: str
     max_retries: int
     batch_retry_delay_seconds: int
+    max_parallel_groups: int
     task_git_url: str
     task_git_revision: str
 
@@ -290,7 +297,7 @@ def execute_batch(
 
     try:
         request_name = create(
-            "update-fbc-catalog",
+            UPDATE_FBC_CATALOG_PIPELINE,
             params=params,
             labels=labels,
             sync=True,
@@ -299,6 +306,9 @@ def execute_batch(
             pipeline_timeout=pipeline_timeout,
             task_timeout=task_timeout,
             finally_timeout=finally_timeout,
+            # Prior requests are removed once in run(). Concurrent creates share
+            # pipeline-run labels, so per-request cleanup would delete siblings.
+            cleanup=False,
         )
     except InternalRequestWaitError as e:
         logger.error("Batch %d internal request failed: %s", batch_num + 1, e)
@@ -459,14 +469,24 @@ def process_ocp_group(
     config: AddFBCContributionConfig,
     data: dict[str, Any],
     results_data: dict[str, Any],
+    results_lock: threading.Lock | None = None,
 ) -> bool:
     """Process all batches for an OCP group.
+
+    Batches in this group run one after another. The index image from a
+    successful batch becomes the fromIndex of the next batch unless
+    mustOverwriteFromIndexImage is set.
 
     Executes all batches first, collects failures, then retries failed batches
     at the end (giving IIB time to recover from transient failures).
 
+    ``results_lock`` serializes writes when several groups run at once. A
+    private lock is used when the caller does not share ``results_data``.
+
     Returns True if all batches succeeded, False otherwise.
     """
+    if results_lock is None:
+        results_lock = threading.Lock()
     logger.info("Processing OCP group %s", group.ocp_version)
 
     num_components = len(group.components)
@@ -514,12 +534,13 @@ def process_ocp_group(
         )
 
         if batch_result.success:
-            results_ok = process_batch_results(
-                batch_result,
-                group,
-                config,
-                results_data,
-            )
+            with results_lock:
+                results_ok = process_batch_results(
+                    batch_result,
+                    group,
+                    config,
+                    results_data,
+                )
             if results_ok:
                 successful_batches.append(batch_num)
                 if not config.must_overwrite_from_index_image and batch_result.index_image:
@@ -566,12 +587,13 @@ def process_ocp_group(
             )
 
             if batch_result.success:
-                results_ok = process_batch_results(
-                    batch_result,
-                    group,
-                    config,
-                    results_data,
-                )
+                with results_lock:
+                    results_ok = process_batch_results(
+                        batch_result,
+                        group,
+                        config,
+                        results_data,
+                    )
                 if results_ok:
                     logger.info(
                         "Batch %d succeeded on retry attempt %d for OCP %s",
@@ -711,8 +733,10 @@ def run(config: AddFBCContributionConfig) -> tuple[dict[str, Any], str]:
     logger.info("  - mustPublishIndexImage: %s", config.must_publish_index_image)
     logger.info("  - mustOverwriteFromIndexImage: %s", config.must_overwrite_from_index_image)
     logger.info("  - iibServiceAccountSecret: %s", config.iib_service_account_secret)
+    logger.info("  - maxParallelGroups: %s", config.max_parallel_groups)
 
     results_data: dict[str, Any] = {"components": []}
+    results_lock = threading.Lock()
 
     groups = group_components_by_ocp_version(
         snapshot,
@@ -723,20 +747,47 @@ def run(config: AddFBCContributionConfig) -> tuple[dict[str, Any], str]:
     total_components = len(snapshot.get("components", []))
     logger.info("Processing %d components", total_components)
 
-    all_succeeded = True
-    for group in groups:
+    # Drop InternalRequests left by an earlier attempt before any group starts.
+    # Later creates pass cleanup=False so in-flight siblings are left alone.
+    cleanup_existing_requests(
+        pipeline=UPDATE_FBC_CATALOG_PIPELINE,
+        labels={PIPELINERUN_LABEL: config.pipeline_run_uid},
+    )
+
+    workers = min(len(groups), max(1, config.max_parallel_groups)) if groups else 1
+    logger.info("Processing %d OCP group(s) with up to %d in parallel", len(groups), workers)
+
+    failed_groups: list[str] = []
+
+    def run_group(group: OCPGroup) -> bool:
+        """Run one OCP group on a worker thread."""
         logger.info("Processing OCP group: %s", group.ocp_version)
-        success = process_ocp_group(
+        return process_ocp_group(
             group,
             config,
             data,
             results_data,
+            results_lock,
         )
-        if not success:
-            all_succeeded = False
-            break
 
-    if not all_succeeded:
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(run_group, group): group for group in groups}
+        for future in as_completed(futures):
+            group = futures[future]
+            error = future.exception()
+            if error is not None:
+                logger.error(
+                    "OCP group %s failed: %s",
+                    group.ocp_version,
+                    error,
+                    exc_info=error,
+                )
+                failed_groups.append(group.ocp_version)
+                continue
+            if not future.result():
+                failed_groups.append(group.ocp_version)
+
+    if failed_groups:
         raise RuntimeError("One or more OCP groups failed to process")
 
     results_data = deduplicate_results(results_data, is_staged)
@@ -785,6 +836,9 @@ def main() -> None:
     )
     max_retries = int(get_optional_env("MAX_RETRIES", "3"))
     batch_retry_delay_seconds = int(get_optional_env("BATCH_RETRY_DELAY_SECONDS", "60"))
+    max_parallel_groups = int(
+        get_optional_env("MAX_PARALLEL_GROUPS", str(DEFAULT_MAX_PARALLEL_GROUPS))
+    )
 
     # Result file paths (optional)
     request_results_file_result = get_optional_env("RESULT_REQUEST_RESULTS_FILE")
@@ -808,6 +862,7 @@ def main() -> None:
         iib_service_account_secret=iib_service_account_secret,
         max_retries=max_retries,
         batch_retry_delay_seconds=batch_retry_delay_seconds,
+        max_parallel_groups=max_parallel_groups,
         task_git_url=task_git_url,
         task_git_revision=task_git_revision,
     )

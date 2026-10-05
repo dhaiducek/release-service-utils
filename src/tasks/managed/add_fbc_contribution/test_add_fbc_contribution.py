@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -46,6 +47,7 @@ def make_config(
         "iib_service_account_secret": "test-iib-secret",
         "max_retries": 3,
         "batch_retry_delay_seconds": 1,
+        "max_parallel_groups": 4,
         "task_git_url": "http://localhost",
         "task_git_revision": "main",
     }
@@ -786,6 +788,132 @@ class TestRun:
 
         assert len(results_data["components"]) == 1
         assert timestamp
+        assert mock_create.call_args.kwargs["cleanup"] is False
+
+
+class TestParallelGroups:
+    """OCP groups run concurrently while batches inside a group stay ordered."""
+
+    def test_run_overlaps_independent_ocp_groups(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Up to max_parallel_groups IIB requests are in flight at once."""
+        components = [
+            make_component(f"comp{version}", version, container_image=f"img{version}")
+            for version in ("4.12", "4.13", "4.14")
+        ]
+        snapshot = make_snapshot(components)
+        data = make_data()
+        snapshot_path = tmp_path / "snapshot.json"
+        data_path = tmp_path / "data.json"
+        snapshot_path.write_text(json.dumps(snapshot))
+        data_path.write_text(json.dumps(data))
+
+        config = make_config(
+            tmp_path,
+            snapshot_path=snapshot_path,
+            data_path=data_path,
+            max_parallel_groups=2,
+            max_retries=0,
+        )
+
+        build_info = {
+            "updated": "2024-03-06T16:39:11Z",
+            "index_image": "quay.io/iib:01",
+            "internal_index_image_copy_resolved": "quay.io/iib@sha256:abc",
+        }
+        in_flight = 0
+        peak = 0
+        reached_limit = threading.Event()
+        state_lock = threading.Lock()
+
+        def mock_create(*args: Any, **kwargs: Any) -> str:
+            nonlocal in_flight, peak
+            assert kwargs["cleanup"] is False
+            with state_lock:
+                in_flight += 1
+                peak = max(peak, in_flight)
+                if in_flight >= config.max_parallel_groups:
+                    reached_limit.set()
+            assert reached_limit.wait(2)
+            with state_lock:
+                in_flight -= 1
+            return "test-ir"
+
+        cleanup = mock.Mock()
+        monkeypatch.setattr(afc, "cleanup_existing_requests", cleanup)
+        monkeypatch.setattr(afc, "create", mock.Mock(side_effect=mock_create))
+        monkeypatch.setattr(
+            afc,
+            "fetch_results",
+            mock.Mock(
+                return_value={
+                    "jsonBuildInfo": iib.compress_build_info(build_info),
+                    "indexImageDigests": "sha256:a",
+                }
+            ),
+        )
+
+        results_data, _timestamp = add_fbc_contribution.run(config)
+
+        assert peak == 2
+        assert len(results_data["components"]) == 3
+        cleanup.assert_called_once_with(
+            pipeline=afc.UPDATE_FBC_CATALOG_PIPELINE,
+            labels={afc.PIPELINERUN_LABEL: config.pipeline_run_uid},
+        )
+
+    def test_run_still_processes_every_group_when_one_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed group does not skip the other groups already eligible to run."""
+        snapshot = make_snapshot(
+            [
+                make_component("comp1", "4.12", container_image="img1"),
+                make_component("comp2", "4.13", container_image="img2"),
+            ]
+        )
+        data = make_data()
+        snapshot_path = tmp_path / "snapshot.json"
+        data_path = tmp_path / "data.json"
+        snapshot_path.write_text(json.dumps(snapshot))
+        data_path.write_text(json.dumps(data))
+        config = make_config(
+            tmp_path,
+            snapshot_path=snapshot_path,
+            data_path=data_path,
+            max_parallel_groups=2,
+            max_retries=0,
+        )
+
+        def mock_create(*args: Any, **kwargs: Any) -> str:
+            fragments = kwargs["params"]["fbcFragments"]
+            if "img1" in fragments:
+                raise InternalRequestWaitError("IIB failure", 21)
+            return "test-ir"
+
+        build_info = {
+            "updated": "2024-03-06T16:39:11Z",
+            "index_image": "quay.io/iib:01",
+            "internal_index_image_copy_resolved": "quay.io/iib@sha256:abc",
+        }
+        mock_create_fn = mock.Mock(side_effect=mock_create)
+        monkeypatch.setattr(afc, "create", mock_create_fn)
+        monkeypatch.setattr(
+            afc,
+            "fetch_results",
+            mock.Mock(
+                return_value={
+                    "jsonBuildInfo": iib.compress_build_info(build_info),
+                    "indexImageDigests": "sha256:a",
+                }
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="One or more OCP groups failed"):
+            add_fbc_contribution.run(config)
+
+        assert mock_create_fn.call_count == 2
 
 
 class TestMain:
